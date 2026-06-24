@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+# sensors.gorilla — Sony VAIO Gorilla System Dashboard
+# Maps every readable hardware sensor on the Sony VAIO SVE14A3AJ:
+#   CPU cores (coretemp), Motherboard (acpitz), Intel HD 4000 (shared package),
+#   AMD Radeon Turks (hwmon/amdgpu), Kingston DC600M Enterprise SSD (smartctl),
+#   Battery wear / health / cycle count (BAT0 + sony-laptop sysfs),
+#   Fan speed + thermal profile (sony-laptop), AC/Battery power (hwmon2).
+# Renders a Gorilla Skynet System thin block-art logo (cyan→orange→red gradient)
+# side-by-side with the live sensor data.
+import glob
+import os
+import sys
+import time
+import argparse
+import subprocess
+import re
+
+
+def get_file_val(path, default="N/A", scale=1):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r") as f:
+            val = f.read().strip()
+            if scale != 1:
+                return float(val) / scale
+            return val
+    except Exception:
+        return default
+
+def get_cpu_temps():
+    readings = {}
+    hwmon_dirs = glob.glob("/sys/devices/platform/coretemp.0/hwmon/hwmon*")
+    if not hwmon_dirs:
+        # Fallback to general thermal zones
+        for path in sorted(glob.glob("/sys/class/thermal/thermal_zone*/temp")):
+            try:
+                zone_id = os.path.basename(os.path.dirname(path))
+                temp = get_file_val(path, scale=1000.0)
+                readings[f"Thermal Zone ({zone_id})"] = temp
+            except Exception:
+                pass
+        return readings
+
+    hwmon_dir = hwmon_dirs[0]
+    inputs = glob.glob(os.path.join(hwmon_dir, "temp*_input"))
+    for input_path in sorted(inputs):
+        try:
+            base = os.path.basename(input_path)
+            prefix = base.split("_")[0]
+            label_path = os.path.join(hwmon_dir, f"{prefix}_label")
+            
+            temp = get_file_val(input_path, scale=1000.0)
+            label = f"Sensor {prefix}"
+            if os.path.exists(label_path):
+                label = get_file_val(label_path)
+            
+            # Map standard system names to friendly, clear descriptions
+            if label == "Package id 0":
+                label = "CPU/GPU Package Peak (Intel i7 / HD 4000)"
+            elif label.startswith("Core"):
+                label = f"{label} (Intel i7 CPU Core)"
+
+                
+            readings[label] = temp
+        except Exception:
+            pass
+    return readings
+
+def get_amd_gpu_temp():
+    # Scan all hwmon dirs for amdgpu or radeon drivers
+    for hwmon_dir in glob.glob("/sys/class/hwmon/hwmon*"):
+        name_path = os.path.join(hwmon_dir, "name")
+        if os.path.exists(name_path):
+            try:
+                with open(name_path, "r") as f:
+                    name = f.read().strip().lower()
+                if "radeon" in name or "amdgpu" in name:
+                    temp_path = os.path.join(hwmon_dir, "temp1_input")
+                    if os.path.exists(temp_path):
+                        temp_val = get_file_val(temp_path, scale=1000.0)
+                        if isinstance(temp_val, float):
+                            return temp_val
+            except Exception:
+                pass
+    return None
+
+def get_battery_health():
+    """Read battery wear level, cycle count, and Sony care limiter."""
+    info = {"health_pct": "N/A", "cycles": "N/A", "care_limit": "N/A"}
+    try:
+        ef  = int(get_file_val("/sys/class/power_supply/BAT0/energy_full",  default="0"))
+        efd = int(get_file_val("/sys/class/power_supply/BAT0/energy_full_design", default="0"))
+        if efd > 0:
+            info["health_pct"] = f"{(ef / efd * 100):.1f}%"
+    except Exception:
+        pass
+    try:
+        cycles = get_file_val("/sys/class/power_supply/BAT0/cycle_count")
+        info["cycles"] = cycles if cycles != "N/A" else "N/A"
+    except Exception:
+        pass
+    try:
+        limit = get_file_val("/sys/devices/platform/sony-laptop/battery_care_limiter")
+        info["care_limit"] = f"{limit}% cap" if limit not in ("N/A", "0") else "Off (full charge)"
+    except Exception:
+        pass
+    return info
+
+def get_ssd_metrics():
+    metrics = {
+        "temp": "N/A",
+        "life": "N/A",
+        "hours": "N/A",
+        "writes": "N/A"
+    }
+    try:
+        res = subprocess.run(["sudo", "smartctl", "-A", "/dev/sda"], capture_output=True, text=True, check=True)
+        for line in res.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 10:
+                attr_id = parts[0]
+                attr_name = parts[1]
+                val = parts[3]
+                raw = parts[9]
+                
+                if attr_id == "194": # Temperature_Celsius
+                    temp_match = re.match(r'^(\d+)', raw)
+                    if temp_match:
+                        metrics["temp"] = float(temp_match.group(1))
+                elif attr_id == "231": # SSD Life Left (VALUE is health percentage)
+                    try:
+                        metrics["life"] = f"{int(val)}%"
+                    except ValueError:
+                        pass
+                elif attr_id == "9": # Power_On_Hours
+                    try:
+                        metrics["hours"] = f"{int(raw)} hrs"
+                    except ValueError:
+                        pass
+                elif attr_id == "241": # Total_LBAs_Written (32MB units)
+                    try:
+                        gb_written = int(raw) * 32 / 1024
+                        metrics["writes"] = f"{gb_written:.2f} GB"
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# GORILLA SKYNET SYSTEM — thin outline logo, zero external dependencies.
+# 3 lines tall × 27 chars wide. Cyan → orange → red true-colour gradient.
+#
+# Letter widths (3 chars each, 1-space separator between letters):
+#   G=╔═╗/║ ╦/╚═╝  O=╔═╗/║ ║/╚═╝  R=╦═╗/╠╦╝/╩╚═  I= ╦ / ║ / ╩
+#   L=╦  /║  /╚═╝  A=╔═╗/╠═╣/╩ ╩  S=╔═╗/╚═╗/╚═╝  K=╦╔═/╠╩╗/╩ ╚
+#   Y=╦ ╦/╚╦╝/ ╩   N=╔╗╔/║║║/╩ ╩  E=╔══/╠══/╚══   T=╔╦╗/ ║ / ╩
+#   M=╔╦╗/║║║/╩ ╩
+# ---------------------------------------------------------------------------
+_LOGO_RAW = [
+    # ── GORILLA ──────────────────────────────
+    "╔═╗ ╔═╗ ╦═╗  ╦  ╦   ╦   ╔═╗",
+    "║ ╦ ║ ║ ╠╦╝  ║  ║   ║   ╠═╣",
+    "╚═╝ ╚═╝ ╩╚═  ╩  ╚═╝ ╚═╝ ╩ ╩",
+    "",
+    # ── SKYNET ───────────────────────────────
+    "╔═╗ ╦╔═ ╦ ╦ ╔╗╔ ╔══ ╔╦╗",
+    "╚═╗ ╠╩╗ ╚╦╝ ║║║ ╠══  ║ ",
+    "╚═╝ ╩ ╚  ╩  ╩ ╩ ╚══  ╩ ",
+    "",
+    # ── SYSTEM ───────────────────────────────
+    "╔═╗ ╦ ╦ ╔═╗ ╔╦╗ ╔══ ╔╦╗",
+    "╚═╗ ╚╦╝ ╚═╗  ║  ╠══ ║║║",
+    "╚═╝  ╩  ╚═╝  ╩  ╚══ ╩ ╩",
+]
+
+def _fire_colour(x: int, width: int):
+    """Map horizontal position to R,G,B: cyan→orange→red (gorilla fire palette)."""
+    t = x / max(width - 1, 1)
+    if t < 0.33:
+        s = t / 0.33
+        return int(s * 255), int(220 + s * (140 - 220)), int(255 + s * (0 - 255))
+    elif t < 0.66:
+        s = (t - 0.33) / 0.33
+        return int(255 + s * (220 - 255)), int(140 + s * (30 - 140)), 0
+    else:
+        s = (t - 0.66) / 0.34
+        return int(220 + s * (180 - 220)), int(30 + s * (0 - 30)), int(s * 60)
+
+def get_skynet_logo_lines():
+    """Return list of ANSI-painted block-art lines, no external deps."""
+    max_w = max(len(l) for l in _LOGO_RAW)
+    result = []
+    for line in _LOGO_RAW:
+        if not line.strip():
+            result.append("")
+            continue
+        out = []
+        for i, ch in enumerate(line):
+            if ch == " ":
+                out.append(" ")
+            else:
+                r, g, b = _fire_colour(i, max_w)
+                out.append(f"\033[1;38;2;{r};{g};{b}m{ch}")
+        result.append("".join(out) + "\033[0m")
+    return result
+
+def build_dashboard():
+    # 1. CPU temps
+    cpu_temps = get_cpu_temps()
+    
+    # 2. Motherboard temp (hwmon1 / acpitz)
+    mboard_temp = get_file_val("/sys/class/hwmon/hwmon1/temp1_input", scale=1000.0)
+    
+    # 3. Sony Fan speed and thermal control profile
+    fan_val = get_file_val("/sys/devices/platform/sony-laptop/fanspeed")
+    fan_speed = f"{fan_val}%" if fan_val != "N/A" else "N/A"
+    
+    thermal_profile = get_file_val("/sys/devices/platform/sony-laptop/thermal_control")
+    
+    # 4. Battery & AC Power Supply status
+    ac_online = get_file_val("/sys/class/power_supply/ADP1/online")
+    power_source = "AC Adapter" if ac_online == "1" else "Battery"
+    
+    bat_charge = get_file_val("/sys/class/power_supply/BAT0/capacity")
+    bat_status = get_file_val("/sys/class/power_supply/BAT0/status")
+    
+    bat_volts_raw = get_file_val("/sys/class/hwmon/hwmon2/in0_input", scale=1000.0)
+    bat_volts = f"{bat_volts_raw:.2f} V" if isinstance(bat_volts_raw, float) else "N/A"
+    
+    bat_power_raw = get_file_val("/sys/class/hwmon/hwmon2/power1_input", scale=1000000.0)
+    bat_power = f"{bat_power_raw:.2f} W" if isinstance(bat_power_raw, float) else "N/A"
+
+    # Format dashboard text lines
+    db_lines = []
+    db_lines.append("\033[1;36m================================================================================\033[0m")
+    db_lines.append("\033[1;36m                       SONY VAIO GORILLA SYSTEM DASHBOARD                       \033[0m")
+    db_lines.append("\033[1;36m================================================================================\033[0m")
+    
+    db_lines.append("\033[1m[SYSTEM TEMPERATURES]\033[0m")
+    
+    # Format CPU Package and Cores
+    pkg_temp = cpu_temps.get("CPU/GPU Package Peak (Intel i7 / HD 4000)", "N/A")
+    if isinstance(pkg_temp, float):
+        color = "\033[91m" if pkg_temp >= 80.0 else "\033[93m" if pkg_temp >= 70.0 else "\033[92m"
+        db_lines.append(f"  {'CPU/GPU Package Peak (Intel i7 / HD 4000)':<47} : {color}{pkg_temp:.1f}°C\033[0m")
+    else:
+        db_lines.append(f"  {'CPU/GPU Package Peak (Intel i7 / HD 4000)':<47} : N/A")
+        
+    for core_label in sorted(cpu_temps.keys()):
+        if "Core" in core_label:
+            temp = cpu_temps[core_label]
+            if isinstance(temp, float):
+                color = "\033[91m" if temp >= 80.0 else "\033[93m" if temp >= 70.0 else "\033[92m"
+                db_lines.append(f"  ├─ {core_label:<44} : {color}{temp:.1f}°C\033[0m")
+            else:
+                db_lines.append(f"  ├─ {core_label:<44} : N/A")
+                
+    if isinstance(mboard_temp, float):
+        color = "\033[91m" if mboard_temp >= 80.0 else "\033[93m" if mboard_temp >= 70.0 else "\033[92m"
+        mboard_label = "Motherboard / Chipset (Sony ACPI Zone)"
+        db_lines.append(f"  ├─ {mboard_label:<44} : {color}{mboard_temp:.1f}°C\033[0m")
+    else:
+        db_lines.append(f"  ├─ {'Motherboard / Chipset (Sony ACPI Zone)':<44} : N/A")
+        
+    # Format Intel HD 4000 (Integrated GPU shares the CPU package silicon package peak temperature)
+    intel_gpu_label = "Intel HD 4000 (Integrated GPU)"
+    if isinstance(pkg_temp, float):
+        color = "\033[91m" if pkg_temp >= 80.0 else "\033[93m" if pkg_temp >= 70.0 else "\033[92m"
+        db_lines.append(f"  ├─ {intel_gpu_label:<44} : {color}{pkg_temp:.1f}°C\033[0m  (Shared Package Die)")
+    else:
+        db_lines.append(f"  ├─ {intel_gpu_label:<44} : N/A  (Shared Package Die)")
+
+    # Format AMD Radeon Turks (Dedicated GPU)
+    amd_temp = get_amd_gpu_temp()
+    amd_gpu_label = "AMD Radeon Turks (Dedicated GPU)"
+    if isinstance(amd_temp, float):
+        color = "\033[91m" if amd_temp >= 80.0 else "\033[93m" if amd_temp >= 70.0 else "\033[92m"
+        db_lines.append(f"  ├─ {amd_gpu_label:<44} : {color}{amd_temp:.1f}°C\033[0m")
+    else:
+        db_lines.append(f"  ├─ {amd_gpu_label:<44} : \033[90mOFF (Disabled in BIOS)\033[0m")
+        
+    # Format Kingston DC600M SSD
+    ssd_metrics = get_ssd_metrics()
+    ssd_temp = ssd_metrics["temp"]
+    ssd_label = "Kingston DC600M Enterprise SSD"
+    if isinstance(ssd_temp, float):
+        color = "\033[91m" if ssd_temp >= 60.0 else "\033[93m" if ssd_temp >= 50.0 else "\033[92m"
+        db_lines.append(f"  └─ {ssd_label:<44} : {color}{ssd_temp:.1f}°C\033[0m")
+    else:
+        db_lines.append(f"  └─ {ssd_label:<44} : N/A")
+        
+    db_lines.append("")
+    db_lines.append("\033[1m[SYSTEM COOLING]\033[0m")
+    db_lines.append(f"  System Fan Speed          : \033[94m{fan_speed}\033[0m")
+    db_lines.append(f"  Active Thermal Profile    : \033[94m{thermal_profile}\033[0m")
+    
+    bat_health = get_battery_health()
+
+    db_lines.append("")
+    db_lines.append("\033[1m[POWER SUPPLY & BATTERY]\033[0m")
+    db_lines.append(f"  Primary Power Source      : \033[97m{power_source}\033[0m")
+    if bat_charge != "N/A":
+        db_lines.append(f"  Battery Charge            : \033[92m{bat_charge}%\033[0m  ({bat_status})")
+    else:
+        db_lines.append("  Battery Charge            : N/A")
+    db_lines.append(f"  ├─ Voltage Readout        : {bat_volts}")
+    db_lines.append(f"  ├─ Current Power Draw     : {bat_power}")
+    db_lines.append(f"  ├─ Battery Wear (Health)  : \033[92m{bat_health['health_pct']}\033[0m  of original capacity")
+    db_lines.append(f"  ├─ Charge Cycle Count     : {bat_health['cycles']}")
+    db_lines.append(f"  └─ Sony Care Limiter      : {bat_health['care_limit']}")
+    
+    db_lines.append("")
+    db_lines.append("\033[1m[STORAGE HEALTH & WORKLOAD (Kingston DC600M 1.92TB Enterprise)]\033[0m")
+    db_lines.append(f"  SSD Remaining Life (Health) : \033[92m{ssd_metrics['life']}\033[0m  (3,504 TBW rated | 1 DWPD @ 5-yr)")
+    db_lines.append(f"  Total Lifetime Writes       : {ssd_metrics['writes']}")
+    db_lines.append(f"  Power-On Hours              : {ssd_metrics['hours']}")
+
+    # --- Remaining TBW Lifespan Projections ---
+    TBW_TOTAL_GB   = 3_504_000.0   # 3,504 TB rated endurance (Kingston DC600M 1.92TB)
+    CAPACITY_GB    = 1_920.0        # 1.92 TB drive
+    try:
+        written_str = ssd_metrics["writes"]  # e.g. "490.75 GB"
+        written_gb  = float(written_str.split()[0])
+    except Exception:
+        written_gb  = 0.0
+    remaining_gb = max(TBW_TOTAL_GB - written_gb, 0.0)
+
+    def _yrs(gb_per_day):
+        """Returns a formatted years string from remaining GB and a daily write rate."""
+        if gb_per_day <= 0:
+            return "∞"
+        y = remaining_gb / gb_per_day / 365.25
+        if y >= 1000:
+            return f"{y:,.0f} yrs"
+        return f"{y:,.1f} yrs"
+
+    db_lines.append("")
+    db_lines.append("  \033[1m[REMAINING LIFE — Real-World Projections]\033[0m")
+    db_lines.append(f"  Remaining rated endurance   : {remaining_gb/1000:,.1f} TB  ({remaining_gb:,.0f} GB left to TBW limit)")
+    db_lines.append("")
+
+    # ── Category 1: Light / Normal Use ─────────────────────────────────────────
+    db_lines.append("  \033[1;36m[1] NORMAL / LIGHT USE\033[0m  (browsing, YouTube, email, office)")
+    db_lines.append(f"  ├─ \033[96mLight User     \033[0m (~2 GB/day)   : \033[92m{_yrs(2):<12}\033[0m  OS logs, occasional downloads")
+    db_lines.append(f"  ├─ \033[96mHome User      \033[0m (~5 GB/day)   : \033[92m{_yrs(5):<12}\033[0m  Web browsing, YouTube, email")
+    db_lines.append(f"  └─ \033[96mPower Casual   \033[0m (~10 GB/day)  : \033[92m{_yrs(10):<12}\033[0m  Gaming, streaming, heavy browsing")
+    db_lines.append("")
+
+    # ── Category 2: Developer / Hardcore ───────────────────────────────────────
+    db_lines.append("  \033[1;33m[2] GORILLA DEVELOPER HARDCORE\033[0m  (compiling, ingesting, AI workloads)")
+    db_lines.append(f"  ├─ \033[93mThis Session   \033[0m (~5 GB/day)   : \033[92m{_yrs(5):<12}\033[0m  ChromaDB ingestion 70k docs + OS (current)")
+    db_lines.append(f"  ├─ \033[93mDev Average    \033[0m (~18 GB/day)  : \033[92m{_yrs(18):<12}\033[0m  2x weekly Firefox/Kernel builds + daily AI")
+    db_lines.append(f"  ├─ \033[93mFull Throttle  \033[0m (~60 GB/day)  : \033[92m{_yrs(60):<12}\033[0m  Daily Firefox (25GB) + Kernel (30GB) + AI/logs")
+    db_lines.append(f"  └─ \033[93mAbsolute Max   \033[0m (~120 GB/day) : \033[92m{_yrs(120):<12}\033[0m  Continuous compiles + 4K encode + vector DB churn")
+    db_lines.append("")
+
+    # ── Category 3: Enterprise Blast ───────────────────────────────────────────
+    db_lines.append("  \033[1;31m[3] ENTERPRISE GRADE (DC600M Designed For)\033[0m")
+    db_lines.append(f"  ├─ \033[91mMixed Use Ent  \033[0m (~200 GB/day) : \033[93m{_yrs(200):<12}\033[0m  DB servers, virtualisation, private cloud")
+    db_lines.append(f"  ├─ \033[91m1 DWPD Rated   \033[0m (~1,920 GB/day): \033[91m{_yrs(1920):<11}\033[0m  Kingston's own 5-yr endurance spec (1 full wipe/day)")
+    db_lines.append(f"  └─ \033[91mWrite Intense  \033[0m (~5,760 GB/day): \033[91m{_yrs(5760):<11}\033[0m  3 DWPD — extreme HPC / transaction logging")
+    db_lines.append("")
+    db_lines.append("  \033[90m  Note: Projections from SMART attr 241 TBW counter. WAF not accounted for.\033[0m")
+    db_lines.append("\033[1;36m================================================================================\033[0m")
+
+
+    logo_lines = get_skynet_logo_lines()
+    LOGO_VISUAL_WIDTH = max(len(l) for l in _LOGO_RAW)  # 57 chars, fixed
+
+    # Combine logo + dashboard side-by-side, logo on the left
+    max_lines = max(len(db_lines), len(logo_lines))
+    combined_lines = []
+
+    # Vertically centre the logo relative to the dashboard text
+    logo_start_offset = max(0, (len(db_lines) - len(logo_lines)) // 2)
+
+    for i in range(max_lines):
+        logo_idx = i - logo_start_offset
+        if 0 <= logo_idx < len(logo_lines):
+            logo_part  = logo_lines[logo_idx]
+            # Pad to fixed visual width so dashboard column stays aligned
+            raw_len    = len(_LOGO_RAW[logo_idx]) if logo_idx < len(_LOGO_RAW) else 0
+            logo_part += " " * max(0, LOGO_VISUAL_WIDTH - raw_len)
+        else:
+            logo_part = " " * LOGO_VISUAL_WIDTH
+
+        db_part = db_lines[i] if i < len(db_lines) else ""
+        combined_lines.append(f"{logo_part}  {db_part}")
+
+    return "\n".join(combined_lines)
+
+def main():
+    is_interval_passed = any(arg in sys.argv for arg in ["-n", "--interval"])
+
+    parser = argparse.ArgumentParser(description="Lightweight Sony VAIO System Dashboard")
+    parser.add_argument("-w", "--watch", action="store_true", help="Monitor system continuously (like watch)")
+    parser.add_argument("-n", "--interval", type=float, default=2.0, help="Refresh interval in seconds (default: 2.0)")
+    args = parser.parse_args()
+
+    should_watch = args.watch or is_interval_passed
+
+    if should_watch:
+        try:
+            while True:
+                # Clear terminal and reset cursor
+                sys.stdout.write("\033[H\033[J")
+                dashboard_output = build_dashboard()
+                print(dashboard_output)
+                print(f"Refreshed every {args.interval}s. Press Ctrl+C to exit.")
+                sys.stdout.flush()
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            print("\nExiting dashboard.")
+            sys.exit(0)
+    else:
+        print(build_dashboard())
+
+if __name__ == "__main__":
+    main()
