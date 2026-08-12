@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+# thermal-profile-daemon — temperature-driven fan-profile stepper for Sony VAIO
+# laptops running the sony-laptop kernel module.
+#
+# The Sony embedded controller owns the fan PWM: Linux cannot set an arbitrary
+# fan speed on these machines. What Linux CAN do is pick which of the firmware
+# fan curves is active (silent / balanced / performance) and force the fan to
+# maximum (fan_forced). This daemon watches the CPU package temperature and
+# steps between those profiles with hysteresis, so the machine ramps up fast
+# under load and calms down only when the load is genuinely gone.
+#
+# Zero dependencies. One file. Companion to sensors.gorilla (same repo).
+#
+# Usage:
+#   thermal-profile-daemon check       audit hardware + tools, suggest installs
+#   thermal-profile-daemon install     install as a systemd service (asks first)
+#   thermal-profile-daemon uninstall   remove the service
+#   thermal-profile-daemon status      one-shot: temp, profile, fan, service
+#   thermal-profile-daemon watch       live view of the daemon's inputs/decisions
+#   thermal-profile-daemon run         the daemon loop itself (systemd calls this)
+
+import os
+import sys
+import time
+import glob
+import signal
+import shutil
+import subprocess
+
+VERSION = "1.0.0"
+
+SONY_DIR = "/sys/devices/platform/sony-laptop"
+THERMAL_CONTROL = os.path.join(SONY_DIR, "thermal_control")
+FAN_SPEED = os.path.join(SONY_DIR, "fanspeed")
+FAN_FORCED = os.path.join(SONY_DIR, "fan_forced")
+
+SERVICE_NAME = "thermal-profile-daemon"
+SERVICE_PATH = f"/etc/systemd/system/{SERVICE_NAME}.service"
+INSTALL_BIN = f"/usr/local/bin/{SERVICE_NAME}"
+CONFIG_PATH = f"/etc/{SERVICE_NAME}.conf"
+
+# ── Tunables (overridable via /etc/thermal-profile-daemon.conf, KEY=VALUE) ──
+DEFAULTS = {
+    "POLL_SECONDS": 5,          # temperature sampling interval
+    "UP_PERFORMANCE_C": 80,     # >= this -> performance, immediately
+    "UP_BALANCED_C": 72,        # >= this -> at least balanced, immediately
+    "FORCED_C": 93,             # >= this sustained -> fan_forced full blast
+    "FORCED_HOLD_S": 15,        # how long over FORCED_C before forcing
+    "FORCED_CLEAR_C": 85,       # < this -> release fan_forced
+    "DOWN_BALANCED_C": 70,      # <= this for DOWN_BALANCED_S -> balanced
+    "DOWN_BALANCED_S": 180,
+    "DOWN_SILENT_C": 55,        # <= this for DOWN_SILENT_S -> silent
+    "DOWN_SILENT_S": 300,
+}
+
+PROFILE_ORDER = ["silent", "balanced", "performance"]
+
+
+# ── helpers ─────────────────────────────────────────────────────────────────
+
+def read_file(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def write_file(path, value):
+    with open(path, "w") as f:
+        f.write(str(value))
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    raw = read_file(CONFIG_PATH)
+    if raw:
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            if key in cfg:
+                try:
+                    cfg[key] = type(DEFAULTS[key])(val.strip())
+                except ValueError:
+                    print(f"config: ignoring bad value for {key}: {val.strip()}",
+                          file=sys.stderr)
+    return cfg
+
+
+def package_temp_c():
+    """CPU package temperature in °C, or None if unreadable.
+
+    Prefers coretemp's 'Package id 0'; falls back to the hottest core, then
+    to the hottest ACPI thermal zone.
+    """
+    for hwmon in glob.glob("/sys/devices/platform/coretemp.*/hwmon/hwmon*"):
+        best = None
+        for inp in glob.glob(os.path.join(hwmon, "temp*_input")):
+            label = read_file(inp.replace("_input", "_label"), "")
+            val = read_file(inp)
+            if val is None:
+                continue
+            t = int(val) / 1000.0
+            if label == "Package id 0":
+                return t
+            best = t if best is None else max(best, t)
+        if best is not None:
+            return best
+    zones = []
+    for z in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
+        val = read_file(z)
+        if val is not None:
+            zones.append(int(val) / 1000.0)
+    return max(zones) if zones else None
+
+
+def current_profile():
+    return read_file(THERMAL_CONTROL)
+
+
+def available_profiles():
+    raw = read_file(os.path.join(SONY_DIR, "thermal_profiles"), "")
+    return raw.split()
+
+
+def set_profile(profile, dry=False):
+    if dry:
+        return
+    write_file(THERMAL_CONTROL, profile)
+
+
+def set_forced(on, dry=False):
+    if dry:
+        return
+    write_file(FAN_FORCED, "1" if on else "0")
+
+
+def log(msg):
+    # stdout goes to the journal under systemd; timestamp added for tty runs
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+# ── the daemon ──────────────────────────────────────────────────────────────
+
+def cmd_run():
+    if not os.path.exists(THERMAL_CONTROL):
+        sys.exit(f"ERROR: {THERMAL_CONTROL} not found. This machine does not "
+                 "expose Sony thermal control (sony-laptop module). "
+                 "Run 'thermal-profile-daemon check' for details. Refusing to run.")
+    if not os.access(THERMAL_CONTROL, os.W_OK):
+        sys.exit("ERROR: no write access to thermal_control — run as root "
+                 "(the systemd service does).")
+
+    cfg = load_config()
+    profiles = available_profiles()
+    for p in PROFILE_ORDER:
+        if p not in profiles:
+            sys.exit(f"ERROR: firmware does not offer the '{p}' profile "
+                     f"(offers: {profiles}). Refusing to run with an "
+                     "incomplete ladder.")
+
+    def clean_exit(signum, frame):
+        log(f"signal {signum}: restoring balanced profile, releasing fan_forced")
+        try:
+            set_forced(False)
+            set_profile("balanced")
+        except OSError as e:
+            log(f"restore failed: {e}")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, clean_exit)
+    signal.signal(signal.SIGINT, clean_exit)
+
+    log(f"thermal-profile-daemon {VERSION} starting; thresholds: "
+        f"perf>={cfg['UP_PERFORMANCE_C']}C bal>={cfg['UP_BALANCED_C']}C "
+        f"forced>={cfg['FORCED_C']}C/{cfg['FORCED_HOLD_S']}s "
+        f"down-bal<={cfg['DOWN_BALANCED_C']}C/{cfg['DOWN_BALANCED_S']}s "
+        f"down-silent<={cfg['DOWN_SILENT_C']}C/{cfg['DOWN_SILENT_S']}s")
+
+    below_balanced_since = None   # when temp first went <= DOWN_BALANCED_C
+    below_silent_since = None
+    over_forced_since = None
+    forced_active = read_file(FAN_FORCED) == "1"
+
+    while True:
+        temp = package_temp_c()
+        if temp is None:
+            log("WARNING: no temperature reading; holding current profile")
+            time.sleep(cfg["POLL_SECONDS"])
+            continue
+
+        now = time.monotonic()
+        profile = current_profile()
+
+        # ── emergency: force fan to max ─────────────────────────────
+        if temp >= cfg["FORCED_C"]:
+            if over_forced_since is None:
+                over_forced_since = now
+            elif not forced_active and now - over_forced_since >= cfg["FORCED_HOLD_S"]:
+                set_forced(True)
+                forced_active = True
+                log(f"{temp:.0f}C sustained {cfg['FORCED_HOLD_S']}s -> fan FORCED to max")
+        else:
+            over_forced_since = None
+            if forced_active and temp < cfg["FORCED_CLEAR_C"]:
+                set_forced(False)
+                forced_active = False
+                log(f"{temp:.0f}C < {cfg['FORCED_CLEAR_C']}C -> fan_forced released")
+
+        # ── step up (immediate) ─────────────────────────────────────
+        if temp >= cfg["UP_PERFORMANCE_C"] and profile != "performance":
+            set_profile("performance")
+            log(f"{temp:.0f}C >= {cfg['UP_PERFORMANCE_C']}C -> performance "
+                f"(was {profile})")
+            profile = "performance"
+        elif temp >= cfg["UP_BALANCED_C"] and profile == "silent":
+            set_profile("balanced")
+            log(f"{temp:.0f}C >= {cfg['UP_BALANCED_C']}C -> balanced (was silent)")
+            profile = "balanced"
+
+        # ── step down (needs sustained cool) ────────────────────────
+        if temp <= cfg["DOWN_BALANCED_C"]:
+            below_balanced_since = below_balanced_since or now
+        else:
+            below_balanced_since = None
+        if temp <= cfg["DOWN_SILENT_C"]:
+            below_silent_since = below_silent_since or now
+        else:
+            below_silent_since = None
+
+        if (profile == "performance" and below_balanced_since
+                and now - below_balanced_since >= cfg["DOWN_BALANCED_S"]):
+            set_profile("balanced")
+            log(f"{temp:.0f}C <= {cfg['DOWN_BALANCED_C']}C for "
+                f"{cfg['DOWN_BALANCED_S']}s -> balanced")
+            below_balanced_since = None
+        elif (profile == "balanced" and below_silent_since
+                and now - below_silent_since >= cfg["DOWN_SILENT_S"]):
+            set_profile("silent")
+            log(f"{temp:.0f}C <= {cfg['DOWN_SILENT_C']}C for "
+                f"{cfg['DOWN_SILENT_S']}s -> silent")
+            below_silent_since = None
+
+        time.sleep(cfg["POLL_SECONDS"])
+
+
+# ── check / install / uninstall / status / watch ───────────────────────────
+
+def probe():
+    """Return a list of (ok, required, label, detail) tuples."""
+    results = []
+
+    sony = os.path.isdir(SONY_DIR)
+    results.append((sony, True, "sony-laptop kernel module (sysfs)",
+                    SONY_DIR if sony else
+                    "not present — this daemon only works on Sony VAIO "
+                    "laptops. On other machines look at 'thermald' or "
+                    "your vendor's platform driver."))
+    if sony:
+        tc = os.path.exists(THERMAL_CONTROL)
+        results.append((tc, True, "thermal_control knob",
+                        f"profiles: {' '.join(available_profiles())}" if tc
+                        else "sony-laptop loaded but no thermal_control — "
+                             "model not supported by the SNC driver"))
+        results.append((os.path.exists(FAN_FORCED), False, "fan_forced knob",
+                        "emergency full-blast lever available"
+                        if os.path.exists(FAN_FORCED) else
+                        "missing — emergency force step will be skipped"))
+
+    temp = package_temp_c()
+    results.append((temp is not None, True, "CPU temperature source",
+                    f"package reads {temp:.0f}°C now" if temp is not None
+                    else "no coretemp hwmon and no thermal zones readable"))
+
+    has_systemd = shutil.which("systemctl") is not None
+    results.append((has_systemd, True, "systemd (for the service install)",
+                    "" if has_systemd else "no systemctl found"))
+
+    for tool, pkg, why in [
+        ("sensors", "lm-sensors", "used by sensors.gorilla for extra detail"),
+        ("smartctl", "smartmontools", "SSD health in sensors.gorilla"),
+    ]:
+        # root tools live in sbin, which user PATHs often omit
+        sbin_path = os.environ.get("PATH", "") + ":/usr/sbin:/sbin"
+        present = shutil.which(tool, path=sbin_path) is not None
+        results.append((present, False, f"{tool} ({pkg})",
+                        why if present else f"optional — install with: "
+                                            f"sudo apt install {pkg}  ({why})"))
+    return results
+
+
+def cmd_check():
+    print(f"thermal-profile-daemon {VERSION} — hardware & tooling check\n")
+    ok_all = True
+    missing_optional_pkgs = []
+    for ok, required, label, detail in probe():
+        mark = "\033[92mOK \033[0m" if ok else (
+            "\033[91mFAIL\033[0m" if required else "\033[93mmiss\033[0m")
+        print(f"  [{mark}] {label}")
+        if detail:
+            print(f"         {detail}")
+        if required and not ok:
+            ok_all = False
+        if not required and not ok and "apt install" in detail:
+            missing_optional_pkgs.append(detail.split("apt install ")[1].split()[0])
+    print()
+    if not ok_all:
+        print("Required pieces are missing — the daemon cannot run on this "
+              "machine as it is. See details above.")
+        return 1
+    print("All required pieces present. 'thermal-profile-daemon install' will:")
+    print(f"  1. copy this script to {INSTALL_BIN}")
+    print(f"  2. write a systemd unit to {SERVICE_PATH}")
+    print("  3. enable + start it now and on every boot (needs sudo)")
+    if missing_optional_pkgs:
+        pkgs = " ".join(missing_optional_pkgs)
+        print(f"\nOptional companion tools are missing. To install them:")
+        print(f"  sudo apt install {pkgs}")
+    return 0
+
+
+UNIT = f"""[Unit]
+Description=Temperature-driven Sony VAIO fan profile stepper
+Documentation=https://github.com/gorillanobakaa-dot/Sensors.Gorilla
+
+[Service]
+Type=simple
+ExecStart={INSTALL_BIN} run
+Restart=on-failure
+# tiny footprint: one python process polling sysfs every few seconds
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def cmd_install():
+    if cmd_check() != 0:
+        return 1
+    print()
+    print("This will install the daemon as a system service (runs as root,")
+    print("because the Sony sysfs knobs are root-writable). Proceed? [y/N] ",
+          end="", flush=True)
+    try:
+        answer = input().strip().lower()
+    except EOFError:
+        answer = ""
+    if answer not in ("y", "yes"):
+        print("Nothing installed.")
+        return 1
+
+    src = os.path.realpath(__file__)
+    steps = [
+        ["sudo", "install", "-m", "755", src, INSTALL_BIN],
+        ["sudo", "tee", SERVICE_PATH],
+        ["sudo", "systemctl", "daemon-reload"],
+        ["sudo", "systemctl", "enable", "--now", SERVICE_NAME],
+    ]
+    subprocess.run(steps[0], check=True)
+    subprocess.run(steps[1], input=UNIT, text=True, check=True,
+                   stdout=subprocess.DEVNULL)
+    subprocess.run(steps[2], check=True)
+    subprocess.run(steps[3], check=True)
+
+    # verify the artifact, not the exit codes
+    active = subprocess.run(["systemctl", "is-active", SERVICE_NAME],
+                            capture_output=True, text=True).stdout.strip()
+    if active != "active":
+        print(f"\nService did not come up (state: {active}). Inspect with:")
+        print(f"  journalctl -u {SERVICE_NAME} -n 20")
+        return 1
+    print(f"\nInstalled and running. The daemon now steps the fan profile "
+          f"automatically.\n  watch it decide : journalctl -fu {SERVICE_NAME}\n"
+          f"  live view       : {SERVICE_NAME} watch\n"
+          f"  tune thresholds : {CONFIG_PATH} (KEY=VALUE, see README)\n"
+          f"  remove          : {SERVICE_NAME} uninstall")
+    return 0
+
+
+def cmd_uninstall():
+    subprocess.run(["sudo", "systemctl", "disable", "--now", SERVICE_NAME],
+                   check=False)
+    subprocess.run(["sudo", "rm", "-f", SERVICE_PATH, INSTALL_BIN], check=True)
+    subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
+    gone = not os.path.exists(SERVICE_PATH) and not os.path.exists(INSTALL_BIN)
+    print("Uninstalled." if gone else "Some files could not be removed.")
+    if os.path.exists(CONFIG_PATH):
+        print(f"Config left in place: {CONFIG_PATH} (remove manually if wanted)")
+    return 0 if gone else 1
+
+
+def service_state():
+    if shutil.which("systemctl") is None:
+        return "no-systemd"
+    return subprocess.run(["systemctl", "is-active", SERVICE_NAME],
+                          capture_output=True, text=True).stdout.strip()
+
+
+def status_line():
+    temp = package_temp_c()
+    t = f"{temp:.0f}°C" if temp is not None else "N/A"
+    fan = read_file(FAN_SPEED, "N/A")
+    forced = " FORCED" if read_file(FAN_FORCED) == "1" else ""
+    return (f"pkg {t} | profile {current_profile() or 'N/A'}"
+            f" | fan {fan}%{forced} | service {service_state()}")
+
+
+def cmd_status():
+    print(status_line())
+    return 0
+
+
+def cmd_watch():
+    try:
+        while True:
+            print(f"\r\033[K{time.strftime('%H:%M:%S')}  {status_line()}",
+                  end="", flush=True)
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print()
+    return 0
+
+
+def main():
+    cmds = {"run": cmd_run, "check": cmd_check, "install": cmd_install,
+            "uninstall": cmd_uninstall, "status": cmd_status,
+            "watch": cmd_watch}
+    arg = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if arg in ("--version", "-V"):
+        print(VERSION)
+        return 0
+    if arg not in cmds:
+        print(__doc__ or "")
+        print(f"unknown command: {arg}\ncommands: {', '.join(cmds)}")
+        return 2
+    return cmds[arg]() or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

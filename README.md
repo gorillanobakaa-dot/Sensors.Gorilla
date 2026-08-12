@@ -22,7 +22,9 @@ Run one command in the terminal and you get a full-screen dashboard showing:
   - *"If you compile Firefox from scratch every single day, it will last 160 years"*
   - *"If you run it at full enterprise blast (1 full overwrite per day as Kingston designed it for), it lasts 5 years"*
 
-On the left side: a **Gorilla Skynet System** logo made of glowing letters in fire colours (cyan → orange → red) rendered entirely in text characters — no images, just Unicode.
+Across the top: a **Gorilla Skynet System** banner made of glowing letters in fire colours (cyan → orange → red) rendered entirely in text characters — no images, just Unicode. Below it the data is laid out in **two columns** (temperatures/cooling/power on the left, storage health on the right) so the whole dashboard fits a maximized window with no scrolling. On narrow terminals it automatically falls back to a single stacked column.
+
+**Companion tool:** [`thermal-profile-daemon`](./thermal-profile-daemon.README.md) — a zero-dependency background service that automatically steps the Sony fan profile (silent/balanced/performance) with CPU temperature, since nothing else on Linux ever touches that knob. The dashboard's `[SYSTEM COOLING]` section shows whether it is running.
 
 ### How was it built?
 
@@ -94,12 +96,12 @@ Rendered across 10 profiles in 3 categories (Normal / Developer Hardcore / Enter
 
 ```
 get_skynet_logo_lines()
-  └── _LOGO_RAW[]           — 11 hand-crafted 3-line thin box-drawing strings
+  └── _LOGO_RAW[]           — 3 hand-crafted thin box-drawing strings (one banner row)
   └── _fire_colour(x, w)    — maps column position → (R, G, B) on cyan→orange→red arc
   └── \033[1;38;2;R;G;Bm    — true-colour bold ANSI per character
 ```
 
-Fixed 27-char width. No PIL. No pyfiglet. No external dependencies.
+Fixed 80-char banner, centred over the dashboard. No PIL. No pyfiglet. No external dependencies.
 
 ### Architecture Overview
 
@@ -112,7 +114,8 @@ sensors.gorilla
 ├── get_ssd_metrics()       — smartctl subprocess parser
 ├── _fire_colour(x, width)  — gradient math
 ├── get_skynet_logo_lines() — ANSI-painted logo renderer
-└── build_dashboard()       — assembles all sections + side-by-side zip
+├── _two_columns()          — ANSI-aware two-column zip (width-adaptive)
+└── build_dashboard()       — banner + two-column assembly, stacked fallback
 ```
 
 ### Notes

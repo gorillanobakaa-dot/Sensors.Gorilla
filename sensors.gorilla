@@ -5,8 +5,10 @@
 #   AMD Radeon Turks (hwmon/amdgpu), Kingston DC600M Enterprise SSD (smartctl),
 #   Battery wear / health / cycle count (BAT0 + sony-laptop sysfs),
 #   Fan speed + thermal profile (sony-laptop), AC/Battery power (hwmon2).
-# Renders a Gorilla Skynet System thin block-art logo (cyan→orange→red gradient)
-# side-by-side with the live sensor data.
+# Renders a Gorilla Skynet System thin block-art banner (cyan→orange→red
+# gradient) across the top, with the sensor data in two columns below so the
+# whole dashboard fits a maximized window without scrolling. Falls back to a
+# single stacked column on narrow terminals.
 import glob
 import os
 import sys
@@ -160,21 +162,31 @@ def get_ssd_metrics():
 #   M=╔╦╗/║║║/╩ ╩
 # ---------------------------------------------------------------------------
 _LOGO_RAW = [
-    # ── GORILLA ──────────────────────────────
-    "╔═╗ ╔═╗ ╦═╗  ╦  ╦   ╦   ╔═╗",
-    "║ ╦ ║ ║ ╠╦╝  ║  ║   ║   ╠═╣",
-    "╚═╝ ╚═╝ ╩╚═  ╩  ╚═╝ ╚═╝ ╩ ╩",
-    "",
-    # ── SKYNET ───────────────────────────────
-    "╔═╗ ╦╔═ ╦ ╦ ╔╗╔ ╔══ ╔╦╗",
-    "╚═╗ ╠╩╗ ╚╦╝ ║║║ ╠══  ║ ",
-    "╚═╝ ╩ ╚  ╩  ╩ ╩ ╚══  ╩ ",
-    "",
-    # ── SYSTEM ───────────────────────────────
-    "╔═╗ ╦ ╦ ╔═╗ ╔╦╗ ╔══ ╔╦╗",
-    "╚═╗ ╚╦╝ ╚═╗  ║  ╠══ ║║║",
-    "╚═╝  ╩  ╚═╝  ╩  ╚══ ╩ ╩",
+    # ── GORILLA · SKYNET · SYSTEM, one 3-line banner row ──
+    "╔═╗ ╔═╗ ╦═╗  ╦  ╦   ╦   ╔═╗   ╔═╗ ╦╔═ ╦ ╦ ╔╗╔ ╔══ ╔╦╗   ╔═╗ ╦ ╦ ╔═╗ ╔╦╗ ╔══ ╔╦╗",
+    "║ ╦ ║ ║ ╠╦╝  ║  ║   ║   ╠═╣   ╚═╗ ╠╩╗ ╚╦╝ ║║║ ╠══  ║    ╚═╗ ╚╦╝ ╚═╗  ║  ╠══ ║║║",
+    "╚═╝ ╚═╝ ╩╚═  ╩  ╚═╝ ╚═╝ ╩ ╩   ╚═╝ ╩ ╚  ╩  ╩ ╩ ╚══  ╩    ╚═╝  ╩  ╚═╝  ╩  ╚══ ╩ ╩",
 ]
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+def _vis_len(s):
+    """Visible width of a string, ignoring ANSI colour codes."""
+    return len(ANSI_RE.sub("", s))
+
+def _pad(s, width):
+    return s + " " * max(0, width - _vis_len(s))
+
+def _two_columns(left, right, gap=3):
+    """Zip two lists of lines side by side, ANSI-aware."""
+    rows = max(len(left), len(right))
+    lw = max((_vis_len(l) for l in left), default=0)
+    out = []
+    for i in range(rows):
+        l = left[i] if i < len(left) else ""
+        r = right[i] if i < len(right) else ""
+        out.append((_pad(l, lw) + " " * gap + r).rstrip())
+    return out
 
 def _fire_colour(x: int, width: int):
     """Map horizontal position to R,G,B: cyan→orange→red (gorilla fire palette)."""
@@ -233,12 +245,8 @@ def build_dashboard():
     bat_power_raw = get_file_val("/sys/class/hwmon/hwmon2/power1_input", scale=1000000.0)
     bat_power = f"{bat_power_raw:.2f} W" if isinstance(bat_power_raw, float) else "N/A"
 
-    # Format dashboard text lines
-    db_lines = []
-    db_lines.append("\033[1;36m================================================================================\033[0m")
-    db_lines.append("\033[1;36m                       SONY VAIO GORILLA SYSTEM DASHBOARD                       \033[0m")
-    db_lines.append("\033[1;36m================================================================================\033[0m")
-    
+    # Left column: temperatures, cooling, power. Right column: storage.
+    db_lines = []   # left column
     db_lines.append("\033[1m[SYSTEM TEMPERATURES]\033[0m")
     
     # Format CPU Package and Cores
@@ -296,7 +304,19 @@ def build_dashboard():
     db_lines.append("\033[1m[SYSTEM COOLING]\033[0m")
     db_lines.append(f"  System Fan Speed          : \033[94m{fan_speed}\033[0m")
     db_lines.append(f"  Active Thermal Profile    : \033[94m{thermal_profile}\033[0m")
-    
+
+    # thermal-profile-daemon (same repo): show whether fan profiles are on autopilot
+    try:
+        daemon_state = subprocess.run(
+            ["systemctl", "is-active", "thermal-profile-daemon"],
+            capture_output=True, text=True).stdout.strip()
+    except Exception:
+        daemon_state = ""
+    if daemon_state == "active":
+        db_lines.append("  Fan Profile Daemon        : \033[92mactive\033[0m (auto-stepping)")
+    else:
+        db_lines.append("  Fan Profile Daemon        : \033[90mnot running\033[0m")
+
     bat_health = get_battery_health()
 
     db_lines.append("")
@@ -312,11 +332,12 @@ def build_dashboard():
     db_lines.append(f"  ├─ Charge Cycle Count     : {bat_health['cycles']}")
     db_lines.append(f"  └─ Sony Care Limiter      : {bat_health['care_limit']}")
     
-    db_lines.append("")
-    db_lines.append("\033[1m[STORAGE HEALTH & WORKLOAD (Kingston DC600M 1.92TB Enterprise)]\033[0m")
-    db_lines.append(f"  SSD Remaining Life (Health) : \033[92m{ssd_metrics['life']}\033[0m  (3,504 TBW rated | 1 DWPD @ 5-yr)")
-    db_lines.append(f"  Total Lifetime Writes       : {ssd_metrics['writes']}")
-    db_lines.append(f"  Power-On Hours              : {ssd_metrics['hours']}")
+    # Right column: storage health + lifetime projections
+    right_lines = []
+    right_lines.append("\033[1m[STORAGE HEALTH & WORKLOAD (Kingston DC600M 1.92TB Enterprise)]\033[0m")
+    right_lines.append(f"  SSD Remaining Life (Health) : \033[92m{ssd_metrics['life']}\033[0m  (3,504 TBW rated | 1 DWPD @ 5-yr)")
+    right_lines.append(f"  Total Lifetime Writes       : {ssd_metrics['writes']}")
+    right_lines.append(f"  Power-On Hours              : {ssd_metrics['hours']}")
 
     # --- Remaining TBW Lifespan Projections ---
     TBW_TOTAL_GB   = 3_504_000.0   # 3,504 TB rated endurance (Kingston DC600M 1.92TB)
@@ -337,60 +358,63 @@ def build_dashboard():
             return f"{y:,.0f} yrs"
         return f"{y:,.1f} yrs"
 
-    db_lines.append("")
-    db_lines.append("  \033[1m[REMAINING LIFE — Real-World Projections]\033[0m")
-    db_lines.append(f"  Remaining rated endurance   : {remaining_gb/1000:,.1f} TB  ({remaining_gb:,.0f} GB left to TBW limit)")
-    db_lines.append("")
+    right_lines.append("")
+    right_lines.append("  \033[1m[REMAINING LIFE — Real-World Projections]\033[0m")
+    right_lines.append(f"  Remaining rated endurance   : {remaining_gb/1000:,.1f} TB  ({remaining_gb:,.0f} GB left to TBW limit)")
+    right_lines.append("")
 
     # ── Category 1: Light / Normal Use ─────────────────────────────────────────
-    db_lines.append("  \033[1;36m[1] NORMAL / LIGHT USE\033[0m  (browsing, YouTube, email, office)")
-    db_lines.append(f"  ├─ \033[96mLight User     \033[0m (~2 GB/day)   : \033[92m{_yrs(2):<12}\033[0m  OS logs, occasional downloads")
-    db_lines.append(f"  ├─ \033[96mHome User      \033[0m (~5 GB/day)   : \033[92m{_yrs(5):<12}\033[0m  Web browsing, YouTube, email")
-    db_lines.append(f"  └─ \033[96mPower Casual   \033[0m (~10 GB/day)  : \033[92m{_yrs(10):<12}\033[0m  Gaming, streaming, heavy browsing")
-    db_lines.append("")
+    right_lines.append("  \033[1;36m[1] NORMAL / LIGHT USE\033[0m  (browsing, YouTube, email, office)")
+    right_lines.append(f"  ├─ \033[96mLight User     \033[0m (~2 GB/day)   : \033[92m{_yrs(2):<12}\033[0m  OS logs, occasional downloads")
+    right_lines.append(f"  ├─ \033[96mHome User      \033[0m (~5 GB/day)   : \033[92m{_yrs(5):<12}\033[0m  Web browsing, YouTube, email")
+    right_lines.append(f"  └─ \033[96mPower Casual   \033[0m (~10 GB/day)  : \033[92m{_yrs(10):<12}\033[0m  Gaming, streaming, heavy browse")
+    right_lines.append("")
 
     # ── Category 2: Developer / Hardcore ───────────────────────────────────────
-    db_lines.append("  \033[1;33m[2] GORILLA DEVELOPER HARDCORE\033[0m  (compiling, ingesting, AI workloads)")
-    db_lines.append(f"  ├─ \033[93mThis Session   \033[0m (~5 GB/day)   : \033[92m{_yrs(5):<12}\033[0m  ChromaDB ingestion 70k docs + OS (current)")
-    db_lines.append(f"  ├─ \033[93mDev Average    \033[0m (~18 GB/day)  : \033[92m{_yrs(18):<12}\033[0m  2x weekly Firefox/Kernel builds + daily AI")
-    db_lines.append(f"  ├─ \033[93mFull Throttle  \033[0m (~60 GB/day)  : \033[92m{_yrs(60):<12}\033[0m  Daily Firefox (25GB) + Kernel (30GB) + AI/logs")
-    db_lines.append(f"  └─ \033[93mAbsolute Max   \033[0m (~120 GB/day) : \033[92m{_yrs(120):<12}\033[0m  Continuous compiles + 4K encode + vector DB churn")
-    db_lines.append("")
+    right_lines.append("  \033[1;33m[2] GORILLA DEVELOPER HARDCORE\033[0m  (compiling, ingesting, AI workloads)")
+    right_lines.append(f"  ├─ \033[93mThis Session   \033[0m (~5 GB/day)   : \033[92m{_yrs(5):<12}\033[0m  70k-doc Chroma ingest + OS (current)")
+    right_lines.append(f"  ├─ \033[93mDev Average    \033[0m (~18 GB/day)  : \033[92m{_yrs(18):<12}\033[0m  2x weekly browser/kernel builds + AI")
+    right_lines.append(f"  ├─ \033[93mFull Throttle  \033[0m (~60 GB/day)  : \033[92m{_yrs(60):<12}\033[0m  Daily browser + kernel builds + AI/logs")
+    right_lines.append(f"  └─ \033[93mAbsolute Max   \033[0m (~120 GB/day) : \033[92m{_yrs(120):<12}\033[0m  Compiles + 4K encode + vector DB churn")
+    right_lines.append("")
 
     # ── Category 3: Enterprise Blast ───────────────────────────────────────────
-    db_lines.append("  \033[1;31m[3] ENTERPRISE GRADE (DC600M Designed For)\033[0m")
-    db_lines.append(f"  ├─ \033[91mMixed Use Ent  \033[0m (~200 GB/day) : \033[93m{_yrs(200):<12}\033[0m  DB servers, virtualisation, private cloud")
-    db_lines.append(f"  ├─ \033[91m1 DWPD Rated   \033[0m (~1,920 GB/day): \033[91m{_yrs(1920):<11}\033[0m  Kingston's own 5-yr endurance spec (1 full wipe/day)")
-    db_lines.append(f"  └─ \033[91mWrite Intense  \033[0m (~5,760 GB/day): \033[91m{_yrs(5760):<11}\033[0m  3 DWPD — extreme HPC / transaction logging")
-    db_lines.append("")
-    db_lines.append("  \033[90m  Note: Projections from SMART attr 241 TBW counter. WAF not accounted for.\033[0m")
-    db_lines.append("\033[1;36m================================================================================\033[0m")
+    right_lines.append("  \033[1;31m[3] ENTERPRISE GRADE (DC600M Designed For)\033[0m")
+    right_lines.append(f"  ├─ \033[91mMixed Use Ent  \033[0m (~200 GB/day) : \033[93m{_yrs(200):<12}\033[0m  DB servers, virtualisation, cloud")
+    right_lines.append(f"  ├─ \033[91m1 DWPD Rated   \033[0m (~1,920 GB/day): \033[91m{_yrs(1920):<11}\033[0m  Kingston 5-yr spec (1 full wipe/day)")
+    right_lines.append(f"  └─ \033[91mWrite Intense  \033[0m (~5,760 GB/day): \033[91m{_yrs(5760):<11}\033[0m  3 DWPD — extreme HPC / txn logging")
+    right_lines.append("")
+    right_lines.append("  \033[90mNote: Projections from SMART attr 241 TBW counter. WAF not accounted for.\033[0m")
 
+    # ── Layout: banner on top, then two columns (stacked if terminal is narrow)
+    left_w = max(_vis_len(l) for l in db_lines)
+    right_w = max(_vis_len(l) for l in right_lines)
+    gap = 3
+    need_cols = left_w + gap + right_w
+    if sys.stdout.isatty():
+        term_cols = os.get_terminal_size().columns
+    else:
+        term_cols = need_cols  # piped/redirected: width doesn't matter
+
+    if term_cols >= need_cols:
+        body = _two_columns(db_lines, right_lines, gap)
+        width = need_cols
+    else:
+        body = db_lines + [""] + right_lines
+        width = max(left_w, right_w)
 
     logo_lines = get_skynet_logo_lines()
-    LOGO_VISUAL_WIDTH = max(len(l) for l in _LOGO_RAW)  # 57 chars, fixed
+    logo_w = max(len(l) for l in _LOGO_RAW)
+    logo_indent = " " * max(0, (width - logo_w) // 2)
 
-    # Combine logo + dashboard side-by-side, logo on the left
-    max_lines = max(len(db_lines), len(logo_lines))
-    combined_lines = []
+    sep = "\033[1;36m" + "=" * width + "\033[0m"
+    title = "\033[1;36m" + "SONY VAIO GORILLA SYSTEM DASHBOARD".center(width) + "\033[0m"
 
-    # Vertically centre the logo relative to the dashboard text
-    logo_start_offset = max(0, (len(db_lines) - len(logo_lines)) // 2)
-
-    for i in range(max_lines):
-        logo_idx = i - logo_start_offset
-        if 0 <= logo_idx < len(logo_lines):
-            logo_part  = logo_lines[logo_idx]
-            # Pad to fixed visual width so dashboard column stays aligned
-            raw_len    = len(_LOGO_RAW[logo_idx]) if logo_idx < len(_LOGO_RAW) else 0
-            logo_part += " " * max(0, LOGO_VISUAL_WIDTH - raw_len)
-        else:
-            logo_part = " " * LOGO_VISUAL_WIDTH
-
-        db_part = db_lines[i] if i < len(db_lines) else ""
-        combined_lines.append(f"{logo_part}  {db_part}")
-
-    return "\n".join(combined_lines)
+    out = [logo_indent + l for l in logo_lines]
+    out += [sep, title, sep]
+    out += body
+    out.append(sep)
+    return "\n".join(out)
 
 def main():
     is_interval_passed = any(arg in sys.argv for arg in ["-n", "--interval"])
