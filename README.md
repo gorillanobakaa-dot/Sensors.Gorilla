@@ -2,7 +2,9 @@
 
 > *A zero-dependency Python 3 terminal dashboard that maps every readable hardware sensor on a Sony VAIO SVE14A3AJ (and any similar Linux machine) into a single, beautiful, colour-coded live readout.*
 
-![sensors.gorilla — the full dashboard in one maximized window: banner on top, temperatures/cooling/power left, SSD health and lifetime projections right](dashboard.png)
+[![sensors.gorilla — the full dashboard in one maximized window: banner on top, temperatures/cooling/power/RAPL wattage/throttle status left, SSD health and lifetime projections right](dashboard.png)](dashboard.png)
+
+*Click the image for full resolution — every value pixel-sharp at 1:1.*
 
 ---
 
