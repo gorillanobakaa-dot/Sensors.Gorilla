@@ -72,6 +72,11 @@ sensors.gorilla -w -n 5  # live watch, custom interval
 | SSD Health | `smartctl -A /dev/sda` | attr 231 VALUE |
 | SSD Lifetime Writes | `smartctl -A /dev/sda` | attr 241 RAW × 32 MB |
 | SSD Power-On Hours | `smartctl -A /dev/sda` | attr 9 RAW |
+| CPU Package Power | `/sys/class/powercap/intel-rapl:0/energy_uj` (2 samples ÷ Δt, via sudo) | — |
+| CPU cores / uncore Power | `intel-rapl:0:0` + `intel-rapl:0:1` energy counters | — |
+| CPU Frequency | max of `/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq` | — |
+| Intel GPU Frequency | `/sys/class/drm/card*/gt_cur_freq_mhz` (+ `gt_max_`) | — |
+| Thermal Throttle Events | `/sys/devices/system/cpu/cpu*/thermal_throttle/*` | — |
 | Fan Speed | `/sys/devices/platform/sony-laptop/fanspeed` | — |
 | Thermal Profile | `/sys/devices/platform/sony-laptop/thermal_control` | — |
 | AC Online | `/sys/class/power_supply/ADP1/online` | — |
@@ -82,6 +87,7 @@ sensors.gorilla -w -n 5  # live watch, custom interval
 | Battery Wear | `BAT0/energy_full` ÷ `BAT0/energy_full_design` | — |
 | Cycle Count | `/sys/class/power_supply/BAT0/cycle_count` | — |
 | Sony Care Limiter | `/sys/devices/platform/sony-laptop/battery_care_limiter` | — |
+| Sony Care Health | `/sys/devices/platform/sony-laptop/battery_care_health` | — |
 
 ### SSD Lifespan Calculation
 
@@ -127,6 +133,9 @@ sensors.gorilla
 - `BAT0/cycle_count` may return `0` on some VAIO BIOSes (counter not exposed by ACPI)
 - SSD lifespan projections do not account for Write Amplification Factor (WAF ≈ 1.5–3×)
 - `sudo` is required for `smartctl` — script will show `N/A` if permission denied
+- `sudo` is also required for RAPL power (`energy_uj` is root-only since kernel 5.10); shows `N/A` without it
+- RAPL wattage is measured over a 0.25 s sample window, adding ~0.5 s to each render
+- The board has no other sensor silicon: DMI declares zero temperature/current probes, the DDR3 SODIMMs carry no thermal sensor, and the Wi-Fi driver exposes no hwmon (verified with dmidecode/i2cdetect/lm-sensors, 2026-08-12)
 
 ---
 

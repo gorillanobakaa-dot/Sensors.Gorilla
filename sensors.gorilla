@@ -151,6 +151,75 @@ def get_ssd_metrics():
     return metrics
 
 
+def get_rapl_power(sample_s=0.25):
+    """CPU silicon power draw in watts via Intel RAPL energy counters.
+
+    Returns {"package": W, "core": W, "uncore": W} or None. energy_uj is
+    root-only since kernel 5.10, so reads go through sudo like smartctl.
+    """
+    paths = {}
+    for d in glob.glob("/sys/class/powercap/intel-rapl:*"):
+        name = get_file_val(os.path.join(d, "name"))
+        key = {"package-0": "package", "core": "core", "uncore": "uncore"}.get(name)
+        if key:
+            paths[key] = os.path.join(d, "energy_uj")
+    if "package" not in paths:
+        return None
+    keys = sorted(paths)
+    files = [paths[k] for k in keys]
+
+    def snap():
+        res = subprocess.run(["sudo", "cat"] + files,
+                             capture_output=True, text=True, check=True)
+        return [int(v) for v in res.stdout.split()], time.monotonic()
+    try:
+        e1, t1 = snap()
+        time.sleep(sample_s)
+        e2, t2 = snap()
+    except Exception:
+        return None
+    dt = t2 - t1
+    if dt <= 0:
+        return None
+    watts = {}
+    for k, a, b in zip(keys, e1, e2):
+        if b >= a:  # skip on counter wraparound
+            watts[k] = (b - a) / dt / 1_000_000.0
+    return watts if "package" in watts else None
+
+def get_frequencies():
+    """Live CPU (max across cores) and Intel GPU frequencies."""
+    cpu_khz = []
+    for p in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"):
+        v = get_file_val(p)
+        if v != "N/A":
+            cpu_khz.append(int(v))
+    cpu_ghz = max(cpu_khz) / 1_000_000.0 if cpu_khz else None
+    gpu_cur = gpu_max = None
+    for card in glob.glob("/sys/class/drm/card*/gt_cur_freq_mhz"):
+        cur = get_file_val(card)
+        mx = get_file_val(card.replace("gt_cur_", "gt_max_"))
+        if cur != "N/A":
+            gpu_cur, gpu_max = int(cur), int(mx) if mx != "N/A" else None
+            break
+    return cpu_ghz, gpu_cur, gpu_max
+
+def get_throttle_stats():
+    """Thermal-throttle event counts since boot (proof of harm, or of none)."""
+    base = "/sys/devices/system/cpu/cpu0/thermal_throttle"
+    pkg_count = get_file_val(os.path.join(base, "package_throttle_count"))
+    pkg_ms = get_file_val(os.path.join(base, "package_throttle_total_time_ms"))
+    if pkg_count == "N/A":
+        return None
+    core_count = 0
+    for p in glob.glob("/sys/devices/system/cpu/cpu*/thermal_throttle/core_throttle_count"):
+        v = get_file_val(p)
+        if v != "N/A":
+            core_count += int(v)
+    return {"pkg": int(pkg_count), "pkg_ms": int(pkg_ms) if pkg_ms != "N/A" else 0,
+            "cores": core_count}
+
+
 # ---------------------------------------------------------------------------
 # GORILLA SKYNET SYSTEM — thin outline logo, zero external dependencies.
 # 3 lines tall × 27 chars wide. Cyan → orange → red true-colour gradient.
@@ -317,6 +386,33 @@ def build_dashboard():
     else:
         db_lines.append("  Fan Profile Daemon        : \033[90mnot running\033[0m")
 
+    # CPU silicon power (RAPL), live frequencies, throttle evidence
+    rapl = get_rapl_power()
+    if rapl:
+        parts = []
+        if "core" in rapl:
+            parts.append(f"cores {rapl['core']:.1f}")
+        if "uncore" in rapl:
+            parts.append(f"gpu/uncore {rapl['uncore']:.1f}")
+        detail = f"  ({' + '.join(parts)} W)" if parts else ""
+        db_lines.append(f"  CPU Package Power (RAPL)  : \033[95m{rapl['package']:.1f} W\033[0m{detail}")
+    else:
+        db_lines.append("  CPU Package Power (RAPL)  : N/A")
+
+    cpu_ghz, gpu_cur, gpu_max = get_frequencies()
+    cpu_s = f"{cpu_ghz:.2f} GHz" if cpu_ghz else "N/A"
+    gpu_s = (f"{gpu_cur} MHz" + (f" (max {gpu_max})" if gpu_max else "")) if gpu_cur is not None else "N/A"
+    db_lines.append(f"  CPU / GPU Frequency       : \033[96m{cpu_s}\033[0m  |  \033[96m{gpu_s}\033[0m")
+
+    throttle = get_throttle_stats()
+    if throttle is None:
+        db_lines.append("  Thermal Throttling        : N/A")
+    elif throttle["pkg"] == 0 and throttle["cores"] == 0:
+        db_lines.append("  Thermal Throttling        : \033[92mnone since boot\033[0m")
+    else:
+        db_lines.append(f"  Thermal Throttling        : \033[91m{throttle['pkg']} pkg / "
+                        f"{throttle['cores']} core events, {throttle['pkg_ms']/1000.0:.1f}s throttled\033[0m")
+
     bat_health = get_battery_health()
 
     db_lines.append("")
@@ -330,7 +426,10 @@ def build_dashboard():
     db_lines.append(f"  ├─ Current Power Draw     : {bat_power}")
     db_lines.append(f"  ├─ Battery Wear (Health)  : \033[92m{bat_health['health_pct']}\033[0m  of original capacity")
     db_lines.append(f"  ├─ Charge Cycle Count     : {bat_health['cycles']}")
-    db_lines.append(f"  └─ Sony Care Limiter      : {bat_health['care_limit']}")
+    care_health = get_file_val("/sys/devices/platform/sony-laptop/battery_care_health")
+    db_lines.append(f"  ├─ Sony Care Limiter      : {bat_health['care_limit']}")
+    db_lines.append(f"  └─ Sony Care Health       : "
+                    f"{care_health + '%' if care_health != 'N/A' else 'N/A'}  (firmware's own estimate)")
     
     # Right column: storage health + lifetime projections
     right_lines = []
