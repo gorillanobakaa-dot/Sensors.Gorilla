@@ -1,3 +1,4 @@
+<!-- Version: 1.0.0 · updated 26-08-13-19-10 -->
 # thermal-profile-daemon 🌡️💨
 
 > *A temperature-driven fan-profile stepper for Sony VAIO laptops on Linux. One

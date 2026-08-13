@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Version: 2.0.0 · updated 26-08-13-20-02
 # sensors.gorilla — Sony VAIO Gorilla System Dashboard
 # Maps every readable hardware sensor on the Sony VAIO SVE14A3AJ:
 #   CPU cores (coretemp), Motherboard (acpitz), Intel HD 4000 (shared package),
@@ -16,6 +17,8 @@ import time
 import argparse
 import subprocess
 import re
+import select
+import signal
 
 
 def get_file_val(path, default="N/A", scale=1):
@@ -246,6 +249,24 @@ def _vis_len(s):
 def _pad(s, width):
     return s + " " * max(0, width - _vis_len(s))
 
+def _own_version():
+    """Read this script's own '# Version: X.Y.Z - updated TS' header.
+
+    Single source: the stamp in the header IS the version, so displaying it can
+    never drift from it. A duplicated VERSION constant is exactly the kind of
+    second copy that put three revisions of this tool on one machine.
+    """
+    try:
+        with open(os.path.abspath(__file__), "r", encoding="utf-8") as fh:
+            for line in [next(fh) for _ in range(8)]:
+                m = re.match(r"#\s*Version:\s*(\S+)(?:\s*\S\s*updated\s*(\S+))?", line)
+                if m:
+                    return m.group(1), (m.group(2) or "")
+    except Exception:
+        pass
+    return "", ""
+
+
 def _two_columns(left, right, gap=3):
     """Zip two lists of lines side by side, ANSI-aware."""
     rows = max(len(left), len(right))
@@ -464,57 +485,118 @@ def build_dashboard():
 
     # ── Category 1: Light / Normal Use ─────────────────────────────────────────
     right_lines.append("  \033[1;36m[1] NORMAL / LIGHT USE\033[0m  (browsing, YouTube, email, office)")
-    right_lines.append(f"  ├─ \033[96mLight User     \033[0m (~2 GB/day)   : \033[92m{_yrs(2):<12}\033[0m  OS logs, occasional downloads")
-    right_lines.append(f"  ├─ \033[96mHome User      \033[0m (~5 GB/day)   : \033[92m{_yrs(5):<12}\033[0m  Web browsing, YouTube, email")
-    right_lines.append(f"  └─ \033[96mPower Casual   \033[0m (~10 GB/day)  : \033[92m{_yrs(10):<12}\033[0m  Gaming, streaming, heavy browse")
+    right_lines.append(f"  ├─ \033[96mLight User     \033[0m (~2 GB/day)   : \033[92m{_yrs(2):<12}\033[0m\x00  OS logs, occasional downloads")
+    right_lines.append(f"  ├─ \033[96mHome User      \033[0m (~5 GB/day)   : \033[92m{_yrs(5):<12}\033[0m\x00  Web browsing, YouTube, email")
+    right_lines.append(f"  └─ \033[96mPower Casual   \033[0m (~10 GB/day)  : \033[92m{_yrs(10):<12}\033[0m\x00  Gaming, streaming, heavy browse")
     right_lines.append("")
 
     # ── Category 2: Developer / Hardcore ───────────────────────────────────────
     right_lines.append("  \033[1;33m[2] GORILLA DEVELOPER HARDCORE\033[0m  (compiling, ingesting, AI workloads)")
-    right_lines.append(f"  ├─ \033[93mThis Session   \033[0m (~5 GB/day)   : \033[92m{_yrs(5):<12}\033[0m  70k-doc Chroma ingest + OS (current)")
-    right_lines.append(f"  ├─ \033[93mDev Average    \033[0m (~18 GB/day)  : \033[92m{_yrs(18):<12}\033[0m  2x weekly browser/kernel builds + AI")
-    right_lines.append(f"  ├─ \033[93mFull Throttle  \033[0m (~60 GB/day)  : \033[92m{_yrs(60):<12}\033[0m  Daily browser + kernel builds + AI/logs")
-    right_lines.append(f"  └─ \033[93mAbsolute Max   \033[0m (~120 GB/day) : \033[92m{_yrs(120):<12}\033[0m  Compiles + 4K encode + vector DB churn")
+    right_lines.append(f"  ├─ \033[93mThis Session   \033[0m (~5 GB/day)   : \033[92m{_yrs(5):<12}\033[0m\x00  70k-doc Chroma ingest + OS (current)")
+    right_lines.append(f"  ├─ \033[93mDev Average    \033[0m (~18 GB/day)  : \033[92m{_yrs(18):<12}\033[0m\x00  2x weekly browser/kernel builds + AI")
+    right_lines.append(f"  ├─ \033[93mFull Throttle  \033[0m (~60 GB/day)  : \033[92m{_yrs(60):<12}\033[0m\x00  Daily browser + kernel builds + AI/logs")
+    right_lines.append(f"  └─ \033[93mAbsolute Max   \033[0m (~120 GB/day) : \033[92m{_yrs(120):<12}\033[0m\x00  Compiles + 4K encode + vector DB churn")
     right_lines.append("")
 
     # ── Category 3: Enterprise Blast ───────────────────────────────────────────
     right_lines.append("  \033[1;31m[3] ENTERPRISE GRADE (DC600M Designed For)\033[0m")
-    right_lines.append(f"  ├─ \033[91mMixed Use Ent  \033[0m (~200 GB/day) : \033[93m{_yrs(200):<12}\033[0m  DB servers, virtualisation, cloud")
-    right_lines.append(f"  ├─ \033[91m1 DWPD Rated   \033[0m (~1,920 GB/day): \033[91m{_yrs(1920):<11}\033[0m  Kingston 5-yr spec (1 full wipe/day)")
-    right_lines.append(f"  └─ \033[91mWrite Intense  \033[0m (~5,760 GB/day): \033[91m{_yrs(5760):<11}\033[0m  3 DWPD — extreme HPC / txn logging")
+    right_lines.append(f"  ├─ \033[91mMixed Use Ent  \033[0m (~200 GB/day) : \033[93m{_yrs(200):<12}\033[0m\x00  DB servers, virtualisation, cloud")
+    right_lines.append(f"  ├─ \033[91m1 DWPD Rated   \033[0m (~1,920 GB/day): \033[91m{_yrs(1920):<11}\033[0m\x00  Kingston 5-yr spec (1 full wipe/day)")
+    right_lines.append(f"  └─ \033[91mWrite Intense  \033[0m (~5,760 GB/day): \033[91m{_yrs(5760):<11}\033[0m\x00  3 DWPD — extreme HPC / txn logging")
     right_lines.append("")
     right_lines.append("  \033[90mNote: Projections from SMART attr 241 TBW counter. WAF not accounted for.\033[0m")
 
-    # ── Layout: banner on top, then two columns (stacked if terminal is narrow)
-    left_w = max(_vis_len(l) for l in db_lines)
-    right_w = max(_vis_len(l) for l in right_lines)
-    gap = 3
-    need_cols = left_w + gap + right_w
+    # ── Layout ────────────────────────────────────────────────────────────────
+    # Two columns wherever they fit, and they should fit: a 1600x900 screen is
+    # the reference, which is about 178 columns at a normal terminal font. The
+    # full layout wants 173, so it USED to clear that by five columns — one
+    # scrollbar or a slightly wider font and it silently dropped to a stacked
+    # layout for no reason the user could see. That margin was the bug.
+    #
+    # So degrade in steps instead of falling off a cliff. The trailing
+    # descriptions on the projection rows ("Gaming, streaming, heavy browse")
+    # are the widest thing here and the least load-bearing, so they go first.
+    # \x00 marks where each one starts.
     if sys.stdout.isatty():
         term_cols = os.get_terminal_size().columns
     else:
-        term_cols = need_cols  # piped/redirected: width doesn't matter
+        term_cols = 10 ** 6  # piped or redirected: never degrade
+
+    def _plan(rows, tight, gap):
+        rows = [l.split("\x00")[0].rstrip() if tight else l.replace("\x00", "")
+                for l in rows]
+        lw = max(_vis_len(l) for l in db_lines)
+        rw = max(_vis_len(l) for l in rows)
+        return rows, lw, rw, lw + gap + rw
+
+    _, _, _, full_need = _plan(right_lines, False, 3)   # what the full layout wants
+    _, _, _, tight_need = _plan(right_lines, True, 1)   # the narrowest it can go
+    for tight, gap in ((False, 3), (True, 3), (True, 1)):
+        rows, left_w, right_w, need_cols = _plan(right_lines, tight, gap)
+        if term_cols >= need_cols:
+            right_lines, trimmed = rows, tight
+            break
+    else:
+        # Nothing fits side by side. Stack — but a stacked column is still 128
+        # wide with the descriptions attached, so drop those too rather than
+        # wrap. Stacking is already the last resort; wrapping on top of it is
+        # not a layout, it is a mess.
+        rows, left_w, right_w, _ = _plan(right_lines, False, 3)
+        if term_cols < max(left_w, right_w):
+            rows, left_w, right_w, _ = _plan(right_lines, True, 3)
+        right_lines = rows
+        gap, trimmed = 3, False
+        need_cols = left_w + gap + right_w
 
     if term_cols >= need_cols:
         body = _two_columns(db_lines, right_lines, gap)
         width = need_cols
+        if trimmed:
+            body += ["", f"\033[90mNote: workload descriptions hidden to fit this "
+                     f"{term_cols}-column terminal; showing them needs "
+                     f"{full_need}.\033[0m"]
     else:
         # GORILLA OVERRIDE: say WHY it stacked. Silent degradation is worse than
         # a visible one — with no note, the stacked layout is indistinguishable
         # from the pre-two-column version of this script, and the obvious
         # conclusion is that the wrong build got installed. It is not: the
         # terminal is just narrower than the panels need.
-        hint = ("\033[90mNote: stacked layout, because this terminal is "
-                f"{term_cols} columns and two columns need {need_cols}.\033[0m")
-        body = db_lines + [""] + right_lines + ["", hint]
-        width = max(left_w, right_w, _vis_len(hint))
+        # Keep this SHORT: width is max(panel, hint), so a chatty note becomes
+        # the widest line on screen and overflows the very terminal it is
+        # apologising about. It did, at 128 characters.
+        # Two short lines, not one long one: width is max(panel, hint), so a
+        # single chatty line becomes the widest thing on screen.
+        #
+        # The second line matters more than the first. A one-shot print cannot
+        # reflow — the text is already in the scrollback, and no program can
+        # reach back and rewrap it. Maximising the window afterwards will not
+        # change this output, so point at the mode that DOES follow the window
+        # instead of leaving the user to resize and re-run.
+        hints = [
+            "\033[90mNote: stacked - this terminal is "
+            f"{term_cols} cols; two columns need {tight_need} "
+            f"({full_need} with descriptions).\033[0m",
+            "\033[90m      Resizing now will not reflow this output. "
+            "Use 'sensors.gorilla -w' to follow the window.\033[0m",
+        ]
+        body = db_lines + [""] + right_lines + [""] + hints
+        width = max([left_w, right_w] + [_vis_len(h) for h in hints])
 
     logo_lines = get_skynet_logo_lines()
     logo_w = max(len(l) for l in _LOGO_RAW)
     logo_indent = " " * max(0, (width - logo_w) // 2)
 
     sep = "\033[1;36m" + "=" * width + "\033[0m"
-    title = "\033[1;36m" + "SONY VAIO GORILLA SYSTEM DASHBOARD".center(width) + "\033[0m"
+    # Version goes ON the dashboard, not just in a header comment. A version you
+    # have to open the file to read does not tell you which build you are
+    # looking at — which is the whole reason for having one.
+    _ver, _when = _own_version()
+    _label = "SONY VAIO GORILLA SYSTEM DASHBOARD"
+    if _ver:
+        _label += f"   v{_ver}"
+        if _when:
+            _label += f" \u00b7 {_when}"
+    title = "\033[1;36m" + _label.center(width) + "\033[0m"
 
     out = [logo_indent + l for l in logo_lines]
     out += [sep, title, sep]
@@ -525,26 +607,90 @@ def build_dashboard():
 def main():
     is_interval_passed = any(arg in sys.argv for arg in ["-n", "--interval"])
 
-    parser = argparse.ArgumentParser(description="Lightweight Sony VAIO System Dashboard")
-    parser.add_argument("-w", "--watch", action="store_true", help="Monitor system continuously (like watch)")
+    parser = argparse.ArgumentParser(
+        description="Sony VAIO system dashboard. Live by default: it follows "
+                    "the window, so resizing the terminal re-lays out the "
+                    "dashboard instead of leaving a stale one on screen.",
+        epilog="Piped or redirected output always prints once and exits, so "
+               "'sensors.gorilla > file' and shell pipelines behave normally.")
+    _v, _w = _own_version()
+    parser.add_argument("-V", "--version", action="version",
+                        version=f"sensors.gorilla {_v or 'unstamped'}"
+                                + (f" (updated {_w})" if _w else ""))
+    parser.add_argument("-1", "--once", action="store_true",
+                        help="print one snapshot and exit (the pre-2.0 default)")
+    parser.add_argument("-w", "--watch", action="store_true",
+                        help="live view (now the default; kept so existing "
+                             "commands and muscle memory keep working)")
     parser.add_argument("-n", "--interval", type=float, default=2.0, help="Refresh interval in seconds (default: 2.0)")
     args = parser.parse_args()
 
-    should_watch = args.watch or is_interval_passed
+    # Live is the default (owner decision 2026-08-13). A one-shot print cannot
+    # reflow when the window is resized - the text is already in the scrollback
+    # - so the default that leaves a stale layout on screen was the wrong one.
+    #
+    # Two hard rules. Not a terminal means print once: otherwise
+    # `sensors.gorilla > file`, a pipeline or a cron job would hang forever.
+    # And --once must always win, so there is a way back.
+    if not sys.stdout.isatty():
+        should_watch = False
+    elif args.once:
+        should_watch = False
+    else:
+        should_watch = True
+    del is_interval_passed
 
     if should_watch:
+        # Follow the window. The terminal sends SIGWINCH the moment it is
+        # resized; without listening for it, a maximised window keeps showing
+        # the layout chosen for the old size until the next tick — up to a full
+        # interval of being visibly wrong. Redraw on the signal instead.
+        #
+        # The wait is a select() on a self-pipe rather than time.sleep(): since
+        # PEP 475 a bare sleep is RESUMED after a signal instead of returning,
+        # so the redraw would still be late. set_wakeup_fd writes a byte into
+        # the pipe from the C-level handler, which wakes select() immediately.
+        # No polling loop, so an idle dashboard costs nothing on battery.
+        wake_r = wake_w = -1
+        if hasattr(signal, "SIGWINCH") and sys.stdout.isatty():
+            wake_r, wake_w = os.pipe()
+            os.set_blocking(wake_w, False)
+            signal.set_wakeup_fd(wake_w)
+            signal.signal(signal.SIGWINCH, lambda *_: None)
+
+        def wait(seconds):
+            """Sleep, but return early the moment the window is resized."""
+            if wake_r < 0:
+                time.sleep(seconds)
+                return
+            try:
+                ready, _, _ = select.select([wake_r], [], [], seconds)
+            except (InterruptedError, OSError):
+                return
+            if ready:
+                try:
+                    os.read(wake_r, 4096)   # drain every queued wake-up byte
+                except OSError:
+                    pass
+
         try:
             while True:
-                # Clear terminal and reset cursor
-                sys.stdout.write("\033[H\033[J")
-                dashboard_output = build_dashboard()
-                print(dashboard_output)
-                print(f"Refreshed every {args.interval}s. Press Ctrl+C to exit.")
+                cols = os.get_terminal_size().columns if sys.stdout.isatty() else 0
+                sys.stdout.write("\033[H\033[J")     # home, then clear screen
+                print(build_dashboard())
+                print(f"Refreshed every {args.interval}s"
+                      + (f" · window {cols} cols, redraws on resize" if cols else "")
+                      + ". Press Ctrl+C to exit.")
                 sys.stdout.flush()
-                time.sleep(args.interval)
+                wait(args.interval)
         except KeyboardInterrupt:
             print("\nExiting dashboard.")
             sys.exit(0)
+        finally:
+            if wake_w >= 0:
+                signal.set_wakeup_fd(-1)
+                os.close(wake_w)
+                os.close(wake_r)
     else:
         print(build_dashboard())
 
