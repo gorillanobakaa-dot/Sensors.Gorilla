@@ -26,7 +26,7 @@ Run one command in the terminal and you get a full-screen dashboard showing:
   - *"If you compile Firefox from scratch every single day, it will last 160 years"*
   - *"If you run it at full enterprise blast (1 full overwrite per day as Kingston designed it for), it lasts 5 years"*
 
-Across the top: a **Gorilla Skynet System** banner made of glowing letters in fire colours (cyan → orange → red) rendered entirely in text characters — no images, just Unicode. Below it the data is laid out in **two columns** (temperatures/cooling/power on the left, storage health on the right) so the whole dashboard fits a maximized window with no scrolling. On narrow terminals it automatically falls back to a single stacked column.
+Across the top: a **Gorilla Skynet System** banner made of glowing letters in fire colours (cyan → orange → red) rendered entirely in text characters — no images, just Unicode. Below it the data is laid out in **two columns** (temperatures/cooling/power on the left, storage health on the right) so the whole dashboard fits a maximized window with no scrolling. On narrow terminals it automatically falls back to a single stacked column, and prints a line saying so — a stacked dashboard looks a lot like an older version of the script, so it tells you the terminal is the reason.
 
 **Companion tool:** [`thermal-profile-daemon`](./thermal-profile-daemon.README.md) — a zero-dependency background service that automatically steps the Sony fan profile (silent/balanced/performance) with CPU temperature, since nothing else on Linux ever touches that knob. The dashboard's `[SYSTEM COOLING]` section shows whether it is running.
 
@@ -45,6 +45,7 @@ The SSD lifespan maths uses the drive manufacturer's (Kingston) official rated e
 - Python 3 (stdlib only — `glob`, `os`, `subprocess`, `re`, `time`, `argparse`)
 - `smartmontools` (`sudo apt install smartmontools`) — for SMART attribute reads via `sudo smartctl -A /dev/sda`
 - Linux kernel with `coretemp`, `acpitz`, `sony-laptop` modules loaded (standard on VAIO SVE14A3AJ)
+- **A terminal at least ~173 columns wide for the two-column layout.** That figure is not a constant in the code: `need_cols` is computed at runtime from the rendered width of both panels (`sensors.gorilla:492`), so it shifts as panel content changes — 173 is what it measures on the reference machine. Anything narrower stacks into one column and says why. Check yours with `tput cols`.
 
 ### Installation
 
@@ -111,7 +112,7 @@ get_skynet_logo_lines()
   └── \033[1;38;2;R;G;Bm    — true-colour bold ANSI per character
 ```
 
-Fixed 80-char banner, centred over the dashboard. No PIL. No pyfiglet. No external dependencies.
+Banner is 79 columns wide, centred over the dashboard — the width is measured at runtime (`logo_w`), never assumed. No PIL. No pyfiglet. No external dependencies.
 
 ### Architecture Overview
 

@@ -499,8 +499,15 @@ def build_dashboard():
         body = _two_columns(db_lines, right_lines, gap)
         width = need_cols
     else:
-        body = db_lines + [""] + right_lines
-        width = max(left_w, right_w)
+        # GORILLA OVERRIDE: say WHY it stacked. Silent degradation is worse than
+        # a visible one — with no note, the stacked layout is indistinguishable
+        # from the pre-two-column version of this script, and the obvious
+        # conclusion is that the wrong build got installed. It is not: the
+        # terminal is just narrower than the panels need.
+        hint = ("\033[90mNote: stacked layout, because this terminal is "
+                f"{term_cols} columns and two columns need {need_cols}.\033[0m")
+        body = db_lines + [""] + right_lines + ["", hint]
+        width = max(left_w, right_w, _vis_len(hint))
 
     logo_lines = get_skynet_logo_lines()
     logo_w = max(len(l) for l in _LOGO_RAW)
