@@ -1,6 +1,17 @@
 <!-- Version: 2.2.0 · updated 26-08-13-20-13 -->
 # sensors.gorilla 🦍
 
+<!-- WHO-THIS-IS-FOR: managed block, do not edit by hand -->
+
+**One live terminal readout of every hardware sensor your laptop will admit to, with nothing to install.**
+
+Built for the people every other tool prices out: kids with no credit
+card, 15-year-old laptops, data sold by the megabyte. Free forever, by
+design, not as a trial.
+Why, with the numbers: [PHILOSOPHY.md](https://github.com/gorillanobakaa-dot/Gorilla.Opencode/blob/main/PHILOSOPHY.md)
+
+<!-- /WHO-THIS-IS-FOR -->
+
 > *A zero-dependency Python 3 terminal dashboard that maps every readable
 > hardware sensor on a Sony VAIO SVE14A3AJ — and any similar Linux machine —
 > into one live, colour-coded readout that follows the window as you resize it.*
